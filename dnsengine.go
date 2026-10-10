@@ -1,6 +1,10 @@
 package urlfilter
 
 import (
+	"cmp"
+	"slices"
+	"sort"
+
 	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/syncutil"
 	"github.com/AdguardTeam/urlfilter/filterlist"
@@ -12,8 +16,12 @@ import (
 // First, it looks over network rules and returns first rule found.
 // Then, if nothing found, it looks up the host rules.
 type DNSEngine struct {
-	// ruleIndex is a map for hosts mapped to the list of rule indexes.
-	ruleIndex map[string][]filterlist.StorageID
+	// ruleIndex is a frozen, hash-sorted index over all host-rule hostnames.
+	// It replaces a map[string][]StorageID: entries are (hash, id) pairs sorted
+	// by hash, so a lookup is a binary search plus a verification pass over the
+	// (rare) hash collisions.  This removes the per-hostname map entry, the
+	// per-hostname slice allocation, and the retained hostname strings.
+	ruleIndex []hashEntry
 
 	// networkEngine is the network engine constructed from the network rules.
 	networkEngine *NetworkEngine
@@ -31,6 +39,31 @@ type DNSEngine struct {
 	rulesCount uint64
 }
 
+// hashEntry pairs a hostname hash with the storage ID of a rule that matches
+// it.  Hash collisions are resolved by verifying the retrieved rule's
+// hostnames, so a collision only costs an extra comparison, never a wrong
+// answer.
+type hashEntry struct {
+	h  uint64
+	id filterlist.StorageID
+}
+
+// hostHash returns the FNV-1a 64-bit hash of a hostname.
+func hostHash(s string) (h uint64) {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+
+	h = offset64
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime64
+	}
+
+	return h
+}
+
 // bytesPerRuleEst is the estimate of how many bytes a single rule generally
 // takes.  It is based on the AdGuard Base DNS list.
 const bytesPerRuleEst = 64
@@ -42,7 +75,7 @@ func NewDNSEngine(s *filterlist.RuleStorage) (e *DNSEngine) {
 
 	e = &DNSEngine{
 		rulesStorage: s,
-		ruleIndex:    make(map[string][]filterlist.StorageID, numRulesEst),
+		ruleIndex:    make([]hashEntry, 0, numRulesEst),
 		rulesCount:   0,
 		reqPool:      syncutil.NewPool(func() (v *rules.Request) { return &rules.Request{} }),
 		rulesPool:    syncutil.NewSlicePool[*rules.HostRule](1),
@@ -66,6 +99,12 @@ func NewDNSEngine(s *filterlist.RuleStorage) (e *DNSEngine) {
 
 	e.rulesCount += netEng.rulesCount
 	e.networkEngine = netEng
+
+	// Freeze the index.  A stable sort keeps the rules of one hostname in
+	// their insertion order, which the callers rely on for rule precedence.
+	slices.SortStableFunc(e.ruleIndex, func(a, b hashEntry) (res int) {
+		return cmp.Compare(a.h, b.h)
+	})
 
 	return e
 }
@@ -164,9 +203,15 @@ func (e *DNSEngine) appendFromIndex(
 ) (res []*rules.HostRule) {
 	res = matching
 
-	ids := e.ruleIndex[hostname]
-	for _, id := range ids {
-		res = append(res, e.rulesStorage.RetrieveHostRule(id))
+	idx := e.ruleIndex
+	h := hostHash(hostname)
+
+	i := sort.Search(len(idx), func(i int) (ge bool) { return idx[i].h >= h })
+	for ; i < len(idx) && idx[i].h == h; i++ {
+		r := e.rulesStorage.RetrieveHostRule(idx[i].id)
+		if r != nil && slices.Contains(r.Hostnames, hostname) {
+			res = append(res, r)
+		}
 	}
 
 	return res
@@ -175,7 +220,7 @@ func (e *DNSEngine) appendFromIndex(
 // addRule adds rule to the index
 func (e *DNSEngine) addRule(hostRule *rules.HostRule, id filterlist.StorageID) {
 	for _, hostname := range hostRule.Hostnames {
-		e.ruleIndex[hostname] = append(e.ruleIndex[hostname], id)
+		e.ruleIndex = append(e.ruleIndex, hashEntry{h: hostHash(hostname), id: id})
 	}
 
 	e.rulesCount++
